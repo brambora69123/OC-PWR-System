@@ -1,0 +1,12 @@
+# OpenComputers runtime files
+*.o
+*.tmp
+*.bak
+
+# Config files (user-specific)
+/pwr_cfg.lua
+/home/
+
+# OS files
+.DS_Store
+Thumbs.db

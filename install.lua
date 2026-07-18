@@ -1,0 +1,127 @@
+--[[
+  PWR Reactor Control System - Installer
+  Run this on each computer to install the required files.
+  
+  Usage:
+    Reactor PC:       pastebin run <code> or upload and run install.lua
+    Control Room PC:  pastebin run <code> or upload and run install.lua
+  
+  The installer will detect which components are available and copy
+  only the files needed for that computer.
+]]
+
+local component = require("component")
+local computer  = require("computer")
+local fs        = require("filesystem")
+local shell     = require("shell")
+
+local GITHUB_BASE = "https://raw.githubusercontent.com/brambora69123/OC-PWR-System/main/"
+
+local REACTOR_FILES = {
+  "lib/protocol.lua",
+  "lib/reactor_ctrl.lua",
+  "lib/colors.lua",
+  "reactor_server.lua",
+}
+
+local CLIENT_FILES = {
+  "lib/protocol.lua",
+  "lib/reactor_ctrl.lua",
+  "lib/colors.lua",
+  "lib/gpu2.lua",
+  "lib/GUI.lua",
+  "lib/advancedLua.lua",
+  "lib/doubleBuffering.lua",
+  "lib/color.lua",
+  "lib/image.lua",
+  "lib/unicode.lua",
+  "control_client.lua",
+  "setup_screens.lua",
+}
+
+local function detectType()
+  if component.isAvailable("ntm_pwr_control") then
+    return "reactor"
+  elseif component.isAvailable("gpu") and component.gpu.getDepth() >= 8 then
+    return "client"
+  end
+  return "unknown"
+end
+
+local function download(path)
+  local url = GITHUB_BASE .. path
+  io.write("  Downloading " .. path .. "... ")
+  local ok, reason = shell.execute('wget -fq "' .. url .. '" "' .. path .. '"')
+  if ok then
+    io.write("OK\n")
+    return true
+  else
+    io.write("FAILED: " .. tostring(reason) .. "\n")
+    return false
+  end
+end
+
+local function ensureDir(path)
+  local dir = fs.path(path)
+  if dir and not fs.exists(dir) then
+    fs.makeDirectory(dir)
+  end
+end
+
+local function installFileList(files)
+  local ok = 0
+  local fail = 0
+  for _, path in ipairs(files) do
+    ensureDir(path)
+    if download(path) then
+      ok = ok + 1
+    else
+      fail = fail + 1
+    end
+  end
+  return ok, fail
+end
+
+local function main()
+  print("========================================")
+  print("  PWR Reactor Control System Installer")
+  print("========================================")
+  print()
+
+  local compType = detectType()
+  print("Detected component type: " .. compType)
+
+  if compType == "unknown" then
+    print()
+    print("Could not auto-detect computer type.")
+    print("Please select:")
+    print("  [1] Reactor PC (has ntm_pwr_control)")
+    print("  [2] Control Room PC (has dual GPU/screen)")
+    io.write("Choice: ")
+    local choice = io.read()
+    if choice == "1" then compType = "reactor"
+    elseif choice == "2" then compType = "client"
+    else print("Invalid choice."); return end
+  end
+
+  print()
+  if compType == "reactor" then
+    print("Installing REACTOR files...")
+    print()
+    local ok, fail = installFileList(REACTOR_FILES)
+    print()
+    print("Done. " .. ok .. " OK, " .. fail .. " failed.")
+    print()
+    print("Run with: reactor_server")
+  else
+    print("Installing CONTROL ROOM files...")
+    print()
+    local ok, fail = installFileList(CLIENT_FILES)
+    print()
+    print("Done. " .. ok .. " OK, " .. fail .. " failed.")
+    print()
+    print("Run setup_screens once, then: control_client")
+  end
+end
+
+main()

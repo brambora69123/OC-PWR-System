@@ -1,0 +1,1244 @@
+local component = require("component")
+local event     = require("event")
+local computer  = require("computer")
+
+local CFG = {
+  AUTO = {
+    CALIBRATED  = false,
+    CAL_FILE    = "/home/pwr_cfg.lua",
+    WARN_F      = 0.75,
+    AZ1_F       = 0.85,
+    AZ2_F       = 0.92,
+    SCRAM_F     = 0.96,
+    PWR_MIN_F   = 0.10,
+    PWR_MAX_F   = 0.75,
+  },
+
+  HEAT = {
+    CAP         = 10000000,
+    WARN        = 0,
+    AZ1         = 0,
+    AZ2         = 0,
+    SCRAM       = 0,
+    PWR_MIN     = 0,
+    PWR_MAX     = 0,
+  },
+
+  RODS = {
+    IDLE        = 98,
+    START       = 70,
+    PWR_FLOOR   = 5,
+  },
+
+  LF = {
+    ENABLED      = true,
+    FIXED_PCT    = 40,
+    BUF_SETPOINT = 70,
+    DEADBAND     = 3,
+    RAMP_RATE    = 0.4,
+    KP           = 1.5,
+    KI           = 0.01,
+    KD           = 1.0,
+    WINDUP       = 10,
+  },
+
+  PID = {
+    KP          = 0.000005,
+    KI          = 0.0000001,
+    KD          = 0.00001,
+    WINDUP      = 1000000,
+    ROD_CLAMP   = 5.0,
+    DT_MIN      = 0.005,
+  },
+
+  COOLANT = {
+    COLD_WARN   = 15,
+    COLD_SCRAM  = 5,
+    HOT_WARN    = 82,
+    HOT_REDUCE  = 95,
+    HOT_SCRAM   = 99,
+  },
+
+  FUEL  = { WARN_PCT = 20, STOP_PCT = 90 },
+  RAD   = { WARN = 100, SCRAM = 500 },
+
+  SYS = {
+    VERSION      = "7.9.1",
+    CYCLE        = 0.20,
+    LOG_MAX      = 400,
+    AUDIO        = true,
+    RS_SIREN     = true,
+    RS_SIDE      = 2,
+    RS_DIESEL    = 3,
+    DIESEL_BUF   = 20,
+    DIESEL_STOP  = 30,
+    DIESEL_SCRAM = true,
+  },
+}
+
+local S = {
+  mode        = "INIT",
+  coreHeat    = 0,  hullHeat   = 0,
+  heatCap     = CFG.HEAT.CAP,  hullCap = CFG.HEAT.CAP,
+  flux        = 0,
+  rodLogical  = 100,  rodTarget = 100,
+  fuelAmt     = 0,  fuelProg = 0,  fuelMax = 1,
+  coldFill    = 0,  coldMax  = 128000,
+  hotFill     = 0,  hotMax   = 128000,
+  radiation   = 0,
+
+  energyFill  = -1,  energyMax = 1,  energyDelta = 0,
+  powerGauge  = 0,
+
+  lfPowerPct  = CFG.LF.FIXED_PCT,
+  lfIntegral  = 0,  lfPrevErr = 0,
+  heatTarget  = CFG.HEAT.PWR_MIN,
+
+  pidIntegral = 0,  pidPrevErr = 0,  pidOut = 0,
+
+  heatHist    = {},  heatTrend = 0,
+
+  thWarn      = 0,  thAZ1  = 0,
+  thAZ2       = 0,  thScram= 0,
+
+  az1Active   = false,  az2Active = false,
+  scramActive = false,  scramReason = "",
+
+  uptime      = 0,  scramCount = 0,
+  cycleCount  = 0,  lastTime   = computer.uptime(),
+  sirenOn     = false,
+  dieselOn    = false,
+  dieselCount = 0,
+
+  startTimer  = 0,  initTimer  = 0,
+  calRodsLock = false,
+
+  calStep     = 0,
+  calTimer    = 0,
+  calData     = {},
+  calStatus   = "",
+
+  page        = 1,
+  blink       = false,  blinkTimer = 0,
+  screenW     = 80,  screenH = 25,
+
+  log         = {},  logHash = "",  logDupCnt = 0,
+
+  dbgHeatType = "--",  dbgHeatKeys = "--",  dbgHeatErr = "--",
+  dbgFuelType = "--",  dbgFuelKeys = "--",  dbgCoolant = "--",
+}
+
+local C   = {}
+local GPU = nil
+
+local function findComp(name, req)
+  if component.isAvailable(name) then
+    local a = component.list(name)()
+    if a then return component.proxy(a) end
+  end
+  if req then error("Component not found: "..name) end
+  return nil
+end
+
+local function initComponents()
+  C.pwr    = findComp("ntm_pwr_control",    true)
+  C.energy = findComp("ntm_energy_storage", false)
+  C.gauge  = findComp("ntm_power_gauge",    false)
+  C.geiger = findComp("ntm_geiger",         false)
+  C.rs     = findComp("redstone",           false)
+  if component.isAvailable("gpu") then
+    GPU = component.gpu
+    local w,h = GPU.getResolution()
+    if w<160 or h<50 then
+      pcall(GPU.setResolution,160,50)
+      w,h=GPU.getResolution()
+    end
+    if w<80 or h<25 then pcall(GPU.setResolution,80,25); w,h=80,25 end
+    S.screenW, S.screenH = w, h
+  end
+end
+
+local function clamp(v,lo,hi) return math.max(lo,math.min(hi,v)) end
+local function pct(v,m) if (m or 0)<=0 then return 0 end; return clamp(v/m*100,0,100) end
+local function lerp(a,b,t) return a+(b-a)*clamp(t,0,1) end
+local function safe(fn, ...)
+  local ok, r = pcall(fn, ...)
+  return ok and r or nil
+end
+local safeCall = safe
+
+local function fmtN(n)
+  n = math.floor(n or 0)
+  local s = tostring(math.abs(n)); local r,l = "",#s
+  for i=1,l do r=r..s:sub(i,i); if (l-i)%3==0 and i<l then r=r.."," end end
+  return (n<0 and "-" or "")..r
+end
+
+local function fmtT(sec)
+  sec = math.floor(sec)
+  local h=math.floor(sec/3600); local m=math.floor((sec%3600)/60); local s=sec%60
+  if h>0 then return string.format("%d:%02d:%02d",h,m,s) end
+  return string.format("%d:%02d",m,s)
+end
+
+local function tSym(t)
+  if t>50000 then return "^^" elseif t>10000 then return "^"
+  elseif t<-50000 then return "vv" elseif t<-10000 then return "v"
+  else return "-" end
+end
+
+local LVL = {INFO="INF",WARN="WRN",ERROR="ERR",CRIT="!!!"}
+local function log(lv, msg)
+  local hash = lv..msg
+  if hash==S.logHash then S.logDupCnt=S.logDupCnt+1; return end
+  if S.logDupCnt>0 then
+    local e=S.log[#S.log]; if e then e.msg=e.msg..string.format(" [x%d]",S.logDupCnt+1) end
+    S.logDupCnt=0
+  end
+  S.logHash = hash
+  local e = {t=fmtT(S.uptime), lvl=LVL[lv] or "INF", msg=msg}
+  table.insert(S.log, e)
+  while #S.log>CFG.SYS.LOG_MAX do table.remove(S.log,1) end
+  io.write(string.format("[%s][%s] %s\n", e.t, e.lvl, e.msg))
+end
+
+local function saveCfg()
+  local f = io.open(CFG.AUTO.CAL_FILE, "w")
+  if not f then log("WARN","Failed to save config: "..CFG.AUTO.CAL_FILE); return end
+  f:write("-- PWR auto-config v"..CFG.SYS.VERSION.." (auto-generated)\n")
+  f:write("-- Calibration date: T+"..fmtT(S.uptime).."\n\n")
+  f:write("return {\n")
+  f:write(string.format("  CALIBRATED = true,\n"))
+  f:write(string.format("  HEAT_CAP   = %d,\n",  CFG.HEAT.CAP))
+  f:write(string.format("  HEAT_WARN  = %d,\n",  CFG.HEAT.WARN))
+  f:write(string.format("  HEAT_AZ1   = %d,\n",  CFG.HEAT.AZ1))
+  f:write(string.format("  HEAT_AZ2   = %d,\n",  CFG.HEAT.AZ2))
+  f:write(string.format("  HEAT_SCRAM = %d,\n",  CFG.HEAT.SCRAM))
+  f:write(string.format("  PWR_MIN    = %d,\n",  CFG.HEAT.PWR_MIN))
+  f:write(string.format("  PWR_MAX    = %d,\n",  CFG.HEAT.PWR_MAX))
+  f:write(string.format("  PID_KP     = %.9f,\n",CFG.PID.KP))
+  f:write(string.format("  PID_KI     = %.9f,\n",CFG.PID.KI))
+  f:write(string.format("  PID_KD     = %.9f,\n",CFG.PID.KD))
+  f:write(string.format("  LF_BUF_SP  = %d,\n",  CFG.LF.BUF_SETPOINT))
+  f:write(string.format("  LF_RAMP    = %.2f,\n", CFG.LF.RAMP_RATE))
+  f:write("}\n")
+  f:close()
+  log("INFO","Config saved: "..CFG.AUTO.CAL_FILE)
+end
+
+local function loadCfg()
+  local f = io.open(CFG.AUTO.CAL_FILE, "r")
+  if not f then return false end
+  f:close()
+  local ok, data = pcall(dofile, CFG.AUTO.CAL_FILE)
+  if not ok or type(data)~="table" then
+    log("WARN","Config corrupted — recalibration required"); return false
+  end
+  if not data.CALIBRATED then return false end
+
+  CFG.AUTO.CALIBRATED = true
+  CFG.HEAT.CAP        = data.HEAT_CAP   or CFG.HEAT.CAP
+  CFG.HEAT.WARN       = data.HEAT_WARN  or CFG.HEAT.WARN
+  CFG.HEAT.AZ1        = data.HEAT_AZ1   or CFG.HEAT.AZ1
+  CFG.HEAT.AZ2        = data.HEAT_AZ2   or CFG.HEAT.AZ2
+  CFG.HEAT.SCRAM      = data.HEAT_SCRAM or CFG.HEAT.SCRAM
+  CFG.HEAT.PWR_MIN    = data.PWR_MIN    or CFG.HEAT.PWR_MIN
+  CFG.HEAT.PWR_MAX    = data.PWR_MAX    or CFG.HEAT.PWR_MAX
+  CFG.PID.KP          = data.PID_KP     or CFG.PID.KP
+  CFG.PID.KI          = data.PID_KI     or CFG.PID.KI
+  CFG.PID.KD          = data.PID_KD     or CFG.PID.KD
+  CFG.LF.BUF_SETPOINT = data.LF_BUF_SP  or CFG.LF.BUF_SETPOINT
+  CFG.LF.RAMP_RATE    = data.LF_RAMP    or CFG.LF.RAMP_RATE
+
+  log("INFO","Config loaded: "..CFG.AUTO.CAL_FILE)
+  return true
+end
+
+local CAL_STEPS = 5
+
+local function calApplyResults()
+  local d = S.calData
+  local cap = d.heatCap or CFG.HEAT.CAP
+  CFG.HEAT.CAP   = cap
+  CFG.HEAT.WARN  = math.floor(cap * CFG.AUTO.WARN_F)
+  CFG.HEAT.AZ1   = math.floor(cap * CFG.AUTO.AZ1_F)
+  CFG.HEAT.AZ2   = math.floor(cap * CFG.AUTO.AZ2_F)
+  CFG.HEAT.SCRAM = math.floor(cap * CFG.AUTO.SCRAM_F)
+  CFG.HEAT.PWR_MIN = math.floor(cap * CFG.AUTO.PWR_MIN_F)
+  CFG.HEAT.PWR_MAX = math.floor(cap * CFG.AUTO.PWR_MAX_F)
+
+  if (d.energyMax or 0) > 0 then
+    CFG.LF.BUF_SETPOINT = d.energyMax > 1000000 and 70 or 65
+  end
+
+  local dT = d.heatRiseRate or 0
+  if dT > 100 then
+    local scale = math.max(dT, 1000)
+    CFG.PID.KP = clamp(1.5 / scale, 0.0000005, 0.000005)
+    CFG.PID.KI = CFG.PID.KP * 0.03
+    CFG.PID.KD = CFG.PID.KP * 3.0
+    log("INFO",string.format("PID calibrated: dT=%.0f TU/sec -> KP=%.8f", dT, CFG.PID.KP))
+  else
+    log("INFO","Inertia not measured (reactor cold) — default PID")
+  end
+
+  CFG.AUTO.CALIBRATED = true
+  log("INFO",string.format("Calibration complete. heatCap=%s TU, PWR_MAX=%s TU",
+    fmtN(CFG.HEAT.CAP), fmtN(CFG.HEAT.PWR_MAX)))
+end
+
+local function startCalibration()
+  S.mode     = "CALIBRATE"
+  S.calStep  = 0
+  S.calTimer = 0
+  S.calData  = {}
+  S.energyMax = 1
+  S.calStatus = "Initializing calibration..."
+  log("INFO","=== AUTO-CALIBRATION START ===")
+  if C.pwr then pcall(C.pwr.setLevel, 100) end
+  S.rodTarget = 100
+end
+
+local function stepCalibrate(dt)
+  S.calTimer = S.calTimer + dt
+
+  if S.calStep == 0 then
+    S.calStatus = string.format("Step 1/%d: Waiting for API data... (%.1f/3.0 sec)",
+      CAL_STEPS, S.calTimer)
+    if S.calTimer >= 3.0 then
+      if type(S.coreHeat)~="number" or (S.coreHeat==0 and S.fuelAmt==0) then
+        S.calStatus = "ERROR: No data from controller -> FAULT"
+        log("ERROR","Calibration: no data from PWR -> FAULT")
+        S.mode = "FAULT"; return
+      end
+      S.calData.heatAtStart = S.coreHeat
+      S.calStep  = 1
+      S.calTimer = 0
+      log("INFO",string.format("Step 1 OK. Initial heat: %s TU", fmtN(S.coreHeat)))
+    end
+    return
+  end
+
+  if S.calStep == 1 then
+    S.calStatus = string.format("Step 2/%d: Reading reactor heat capacity...", CAL_STEPS)
+    if S.heatCap > 0 then
+      S.calData.heatCap = S.heatCap
+      S.calStep  = 2
+      S.calTimer = 0
+      log("INFO",string.format("Step 2 OK. heatCap = %s TU", fmtN(S.heatCap)))
+    elseif S.calTimer >= 5.0 then
+      S.calData.heatCap = CFG.HEAT.CAP
+      S.calStep  = 2
+      S.calTimer = 0
+      log("WARN","heatCap not received from API — using default "..fmtN(CFG.HEAT.CAP))
+    end
+    return
+  end
+
+  if S.calStep == 2 then
+    S.calStatus = string.format("Step 3/%d: Measuring storage capacity...", CAL_STEPS)
+    if S.calTimer >= 2.0 then
+      S.calData.energyMax = S.energyFill >= 0 and S.energyMax or 0
+      S.calStep  = 3
+      S.calTimer = 0
+      if S.calData.energyMax > 0 then
+        log("INFO",string.format("Step 3 OK. Storage: %s HE max.", fmtN(S.calData.energyMax)))
+      else
+        log("INFO","Step 3 OK. No storage connected — default LF")
+      end
+    end
+    return
+  end
+
+  if S.calStep == 3 then
+    local safeTemp = (S.calData.heatCap or CFG.HEAT.CAP) * 0.3
+    if S.coreHeat > safeTemp then
+      S.calStatus = string.format("Step 4/%d: Skipping inertia test (reactor hot)", CAL_STEPS)
+      S.calData.heatRiseRate = 0
+      S.calStep  = 4
+      S.calTimer = 0
+      log("INFO","Step 4: inertia test skipped — reactor hot")
+      return
+    end
+
+    local testRodLogical = 90
+    if S.calTimer < 0.5 then
+      S.calStatus = string.format("Step 4/%d: Inertia test — extracting rods 10%%...", CAL_STEPS)
+      S.calRodsLock = true
+      if C.pwr then pcall(C.pwr.setLevel, 100-testRodLogical) end
+      S.calData.heatBefore = S.coreHeat
+      S.calData.heatSamples = {}
+    elseif S.calTimer < 5.5 then
+      table.insert(S.calData.heatSamples, S.coreHeat)
+      S.calStatus = string.format("Step 4/%d: Measuring heat rise... (%.1f/5.0 sec)",
+        CAL_STEPS, S.calTimer-0.5)
+    else
+      S.calRodsLock = false
+      if C.pwr then pcall(C.pwr.setLevel, 100) end
+      S.rodTarget = 100
+      local samples = S.calData.heatSamples or {}
+      if #samples >= 2 then
+        local span = (#samples-1) * CFG.SYS.CYCLE
+        local rise = samples[#samples] - samples[1]
+        S.calData.heatRiseRate = rise / math.max(span, 0.1)
+      else
+        S.calData.heatRiseRate = 0
+      end
+      S.calStep  = 4
+      S.calTimer = 0
+      log("INFO",string.format("Step 4 OK. Heat rise rate: %.0f TU/sec",
+        S.calData.heatRiseRate or 0))
+    end
+
+    local capNow = S.calData.heatCap or CFG.HEAT.CAP
+    if S.coreHeat > capNow * 0.4 then
+      S.calRodsLock = false
+      if C.pwr then pcall(C.pwr.setLevel, 100) end
+      S.calStep  = 4
+      S.calTimer = 0
+      S.calData.heatRiseRate = S.heatTrend
+      log("WARN","Inertia test aborted — heat rose too fast")
+    end
+    return
+  end
+
+  if S.calStep == 4 then
+    S.calStatus = string.format("Step 5/%d: Applying results and saving...", CAL_STEPS)
+    if S.calTimer >= 1.0 then
+      calApplyResults()
+      saveCfg()
+      S.calStep  = 5
+      S.calTimer = 0
+      S.calStatus = "Calibration completed successfully!"
+      log("INFO","=== CALIBRATION COMPLETE ===")
+    end
+    return
+  end
+
+  if S.calStep == 5 then
+    if C.pwr then pcall(C.pwr.setLevel, 100) end
+    S.rodTarget = 100
+    if S.calTimer >= 3.0 then
+      S.mode = "IDLE"
+      log("INFO","Switching to IDLE. Press [S] to start.")
+      if CFG.SYS.AUDIO then pcall(computer.beep,880,0.1); pcall(computer.beep,1100,0.1); pcall(computer.beep,1320,0.15) end
+    end
+    return
+  end
+end
+
+local function readAll()
+  if not C.pwr then return false end
+
+  local hOk, h1, h2, h3, h4 = pcall(C.pwr.getHeat)
+  S.dbgHeatErr = hOk and "nil" or "error"
+  if not hOk then
+    S.dbgHeatKeys="(pcall error)"; return false
+  end
+  if type(h1)=="table" then
+    S.dbgHeatType = "table"
+    local kk={}; for k,v in pairs(h1) do table.insert(kk,tostring(k).."="..tostring(v)) end
+    S.dbgHeatKeys = #kk>0 and table.concat(kk,", ") or "(empty)"
+    S.coreHeat = tonumber(h1.coreHeat or h1[1]) or 0
+    S.hullHeat = tonumber(h1.hullHeat or h1[2]) or 0
+    S.heatCap  = math.max(tonumber(h1.coreHeatCapacity or h1[3]) or CFG.HEAT.CAP, 1)
+    S.hullCap  = math.max(tonumber(h1.hullHeatCapacity or h1[4]) or CFG.HEAT.CAP, 1)
+  elseif tonumber(h1) then
+    S.dbgHeatType = "numbers"
+    S.coreHeat = tonumber(h1) or 0
+    S.hullHeat = tonumber(h2) or 0
+    S.heatCap  = math.max(tonumber(h3) or CFG.HEAT.CAP, 1)
+    S.hullCap  = math.max(tonumber(h4) or CFG.HEAT.CAP, 1)
+    S.dbgHeatKeys = string.format("core=%.0f hull=%.0f cap=%.0f", S.coreHeat, S.hullHeat, S.heatCap)
+  else
+    S.dbgHeatType = "nil"
+    S.dbgHeatKeys="(nil)"; S.dbgHeatErr="no data"; return false
+  end
+
+  table.insert(S.heatHist, S.coreHeat)
+  if #S.heatHist>10 then table.remove(S.heatHist,1) end
+  if #S.heatHist>=2 then
+    local span=(#S.heatHist-1)*CFG.SYS.CYCLE
+    S.heatTrend=(S.heatHist[#S.heatHist]-S.heatHist[1])/math.max(span,0.001)
+  end
+
+  local f = safeCall(C.pwr.getFlux)
+  S.flux = type(f)=="table" and (tonumber(f[1]) or 0) or (tonumber(f) or 0)
+
+  local lOk, l1, l2 = pcall(C.pwr.getLevel)
+  if lOk then
+    if type(l1)=="table" then
+      S.rodTarget  = tonumber(l1[1] or l1.rodTarget) or 100
+      S.rodLogical = tonumber(l1[2] or l1.rodLevel)  or 100
+    elseif tonumber(l1) then
+      S.rodTarget  = tonumber(l1) or 100
+      S.rodLogical = tonumber(l2) or S.rodTarget
+    end
+  end
+
+  local fi = safeCall(C.pwr.getFuelInfo)
+  S.dbgFuelType = type(fi)
+  if type(fi)=="table" then
+    local kk2={}; for k,v in pairs(fi) do table.insert(kk2,tostring(k).."="..tostring(v)) end
+    S.dbgFuelKeys = #kk2>0 and table.concat(kk2,", ") or "(empty)"
+    S.fuelAmt  = tonumber(fi.amountLoaded or fi[1]) or 0
+    S.fuelProg = tonumber(fi.progress     or fi[2]) or 0
+    S.fuelMax  = math.max(tonumber(fi.processTime or fi[3]) or 1, 1)
+  elseif type(fi)=="number" then
+    S.dbgFuelKeys="(number="..tostring(fi)..")"; S.fuelAmt=fi
+  else
+    S.dbgFuelKeys="(nil)"
+  end
+
+  local ci = safe(C.pwr.getCoolantInfo)
+  if type(ci)=="table" then
+    S.coldFill = ci[1] or 0
+    S.coldMax  = math.max(ci[2] or 128000, 1)
+    S.hotFill  = ci[3] or 0
+    S.hotMax   = math.max(ci[4] or 128000, 1)
+    S.dbgCoolant=string.format("cold=%d/%d hot=%d/%d",S.coldFill,S.coldMax,S.hotFill,S.hotMax)
+  else
+    S.coldFill = tonumber(ci) or 0
+    S.dbgCoolant="(number or nil)"
+  end
+
+  if C.geiger then S.radiation=tonumber(safeCall(C.geiger.getRads)) or 0 end
+
+  if C.energy then
+    local eOk, v1, v2, v3 = pcall(C.energy.getEnergyInfo)
+    if eOk then
+      local fill2 = tonumber(v1) or 0
+      local maxE2 = tonumber(v2) or 0
+
+      if maxE2 > 0 then
+        if S.energyFill>=0 then S.energyDelta=(fill2-S.energyFill)/(CFG.SYS.CYCLE*20) end
+        S.energyFill = fill2
+        S.energyMax  = math.max(maxE2, 1)
+      else
+        if S.energyFill>=0 then S.energyDelta=(fill2-S.energyFill)/(CFG.SYS.CYCLE*20) end
+        S.energyFill = fill2
+        if S.energyMax <= 1 and fill2 > 0 then S.energyMax=math.max(fill2,1) end
+      end
+    end
+  end
+
+  if C.gauge then
+    local gi=safeCall(C.gauge.getTransfer)
+    if type(gi)=="table" then S.powerGauge=tonumber(gi[1]) or 0 end
+  end
+
+  return true
+end
+
+local function updateLF(dt)
+  if not CFG.LF.ENABLED or S.energyFill<0 then
+    S.lfPowerPct=CFG.LF.FIXED_PCT; S.lfIntegral=0; S.lfPrevErr=0; return
+  end
+
+  local bufPct = pct(S.energyFill, S.energyMax)
+  local err = CFG.LF.BUF_SETPOINT - bufPct
+
+  local activeErr = math.abs(err) > CFG.LF.DEADBAND and err or 0
+
+  local bufDeltaPctSec = -(S.energyDelta * 20) / S.energyMax * 100
+
+  S.lfIntegral = clamp(S.lfIntegral + activeErr*dt, -CFG.LF.WINDUP, CFG.LF.WINDUP)
+
+  local demand = CFG.LF.KP*activeErr + CFG.LF.KI*S.lfIntegral + CFG.LF.KD*bufDeltaPctSec
+  local maxStep = CFG.LF.RAMP_RATE*dt
+  S.lfPowerPct = clamp(
+    clamp(S.lfPowerPct+demand*dt, S.lfPowerPct-maxStep, S.lfPowerPct+maxStep),
+    0, 100)
+  S.lfPrevErr = err
+end
+
+local function pctToHeat(p)
+  return lerp(CFG.HEAT.PWR_MIN, CFG.HEAT.PWR_MAX, p/100)
+end
+
+local function calcThresholds()
+  local cap = (S.heatCap and S.heatCap > 0) and S.heatCap or CFG.HEAT.CAP
+  CFG.HEAT.CAP   = cap
+  CFG.HEAT.WARN  = math.floor(cap * CFG.AUTO.WARN_F)
+  CFG.HEAT.AZ1   = math.floor(cap * CFG.AUTO.AZ1_F)
+  CFG.HEAT.AZ2   = math.floor(cap * CFG.AUTO.AZ2_F)
+  CFG.HEAT.SCRAM = math.floor(cap * CFG.AUTO.SCRAM_F)
+  if not CFG.AUTO.CALIBRATED then
+    CFG.HEAT.PWR_MIN = math.floor(cap * CFG.AUTO.PWR_MIN_F)
+    CFG.HEAT.PWR_MAX = math.floor(cap * CFG.AUTO.PWR_MAX_F)
+  end
+  S.thWarn  = CFG.HEAT.WARN
+  S.thAZ1   = CFG.HEAT.AZ1
+  S.thAZ2   = CFG.HEAT.AZ2
+  S.thScram = CFG.HEAT.SCRAM
+end
+
+local function sendRods(logical)
+  if not C.pwr then return end
+  if S.calRodsLock then return end
+  logical = clamp(math.floor(logical*10+0.5)/10, CFG.RODS.PWR_FLOOR, 100)
+  if math.abs(logical-S.rodTarget)>0.09 then
+    if pcall(C.pwr.setLevel, logical) then S.rodTarget=logical end
+  end
+end
+
+local function sendRodsNow(logical)
+  if not C.pwr then return end
+  pcall(C.pwr.setLevel, clamp(logical,0,100))
+  S.rodTarget=logical
+end
+
+local function pidReset()
+  S.pidIntegral = 0
+  S.pidPrevErr  = S.heatTarget - S.coreHeat
+  S.pidOut      = 0
+end
+
+local function pidStep(dt)
+  local eff=math.max(dt,CFG.PID.DT_MIN)
+  local err=S.heatTarget-S.coreHeat
+  S.pidIntegral=clamp(S.pidIntegral+err*eff,-CFG.PID.WINDUP,CFG.PID.WINDUP)
+  local derr = (err - S.pidPrevErr) / eff
+  S.pidPrevErr = err
+  S.pidOut=clamp(CFG.PID.KP*err+CFG.PID.KI*S.pidIntegral+CFG.PID.KD*derr,
+                 -CFG.PID.ROD_CLAMP, CFG.PID.ROD_CLAMP)
+  return S.pidOut
+end
+
+local function beep(f,d) if CFG.SYS.AUDIO then pcall(computer.beep,f,d) end end
+
+local function sirenOn()
+  if not S.sirenOn then
+    S.sirenOn=true
+    if CFG.SYS.AUDIO then for _=1,3 do pcall(computer.beep,960,0.12); pcall(computer.beep,480,0.08) end end
+    if CFG.SYS.RS_SIREN and C.rs then pcall(C.rs.setOutput,CFG.SYS.RS_SIDE,15) end
+  end
+end
+
+local function sirenOff()
+  if S.sirenOn then
+    S.sirenOn=false
+    if CFG.SYS.RS_SIREN and C.rs then pcall(C.rs.setOutput,CFG.SYS.RS_SIDE,0) end
+  end
+end
+
+local function dieselStart()
+  if not S.dieselOn then
+    S.dieselOn = true
+    S.dieselCount = S.dieselCount + 1
+    if C.rs then pcall(C.rs.setOutput, CFG.SYS.RS_DIESEL, 15) end
+    log("WARN",string.format("=== DIESELS STARTED #%d === (valve open)", S.dieselCount))
+    beep(440,0.1); beep(550,0.1); beep(440,0.1)
+  end
+end
+
+local function dieselStop()
+  if S.dieselOn then
+    S.dieselOn = false
+    if C.rs then pcall(C.rs.setOutput, CFG.SYS.RS_DIESEL, 0) end
+    log("INFO","Diesels stopped — valve closed, reactor normal")
+    beep(550,0.1); beep(440,0.05)
+  end
+end
+
+local function updateDiesel()
+  if not C.rs then return end
+  local bufPct = S.energyFill >= 0 and pct(S.energyFill, S.energyMax) or 100
+  local needDiesel = false
+
+  if CFG.SYS.DIESEL_SCRAM and S.scramActive then needDiesel = true end
+  if S.mode == "FAULT" then needDiesel = true end
+  if S.energyFill >= 0 then
+    if not S.dieselOn and bufPct < CFG.SYS.DIESEL_BUF then
+      needDiesel = true
+    elseif S.dieselOn and bufPct < CFG.SYS.DIESEL_STOP then
+      needDiesel = true
+    end
+  end
+
+  if needDiesel then dieselStart() else dieselStop() end
+end
+local function scram(reason)
+  if S.scramActive then return end
+  S.scramActive=true; S.scramReason=reason
+  S.scramCount=S.scramCount+1; S.mode="SCRAM"
+  sendRodsNow(100); pidReset(); sirenOn()
+  log("CRIT","=== SCRAM #"..S.scramCount.." ===")
+  log("CRIT","Reason: "..reason)
+  log("CRIT",string.format("Heat: %s TU",fmtN(S.coreHeat)))
+end
+
+local function checkProtections()
+  if type(S.coreHeat)~="number" then scram("TELEMETRY LOSS"); return end
+  if S.coreHeat>=S.thScram then
+    scram(string.format("CORE OVERHEAT: %s TU (%.1f%%)",fmtN(S.coreHeat),pct(S.coreHeat,S.heatCap))); return end
+  if S.hullHeat>0 and S.hullHeat>=S.hullCap*0.95 then
+    scram(string.format("HULL OVERHEAT: %s TU",fmtN(S.hullHeat))); return end
+
+  local cp=pct(S.coldFill,S.coldMax)
+  if cp<CFG.COOLANT.COLD_SCRAM then
+    scram(string.format("COOLANT LOSS: %.1f%%",cp)); return end
+  local hp=pct(S.hotFill,S.hotMax)
+  if hp>=CFG.COOLANT.HOT_SCRAM then
+    scram(string.format("HOT TANK: %.1f%%",hp)); return end
+  if S.radiation>=CFG.RAD.SCRAM then
+    scram(string.format("RADIATION: %.0f rad/t",S.radiation)); return end
+
+  if S.coreHeat>=S.thAZ2 then
+    if not S.az2Active then
+      S.az2Active=true
+      log("ERROR",string.format("SCRAM-2: %s TU",fmtN(S.coreHeat)))
+      beep(800,0.2); sendRodsNow(100); pidReset()
+      if S.mode=="POWER" then S.mode="SHUTDOWN" end
+    end
+    return
+  else if S.az2Active then S.az2Active=false; log("INFO","SCRAM-2 cleared") end end
+
+  if S.coreHeat>=S.thAZ1 then
+    if not S.az1Active then
+      S.az1Active=true
+      log("WARN",string.format("SCRAM-1: %s TU",fmtN(S.coreHeat))); beep(600,0.15) end
+    S.lfPowerPct=math.max(S.lfPowerPct-15,0)
+    sendRods(math.min(S.rodTarget+10,100)); return
+  else if S.az1Active then S.az1Active=false; log("INFO","SCRAM-1 cleared") end end
+
+  if S.coreHeat>=S.thWarn then
+    local b=math.floor(S.coreHeat/200000)
+    local pb=math.floor((S.coreHeat-S.heatTrend*CFG.SYS.CYCLE)/200000)
+    if b~=pb then log("WARN",string.format("High heat: %s TU",fmtN(S.coreHeat))) end
+  end
+  if S.coldFill>0 and cp<CFG.COOLANT.COLD_WARN then log("WARN",string.format("Low coolant: %.1f%%",cp)) end
+  if S.hotFill>0 and hp>=CFG.COOLANT.HOT_REDUCE then
+    if S.mode=="POWER" then log("WARN","Hot tank -> power reduction"); S.lfPowerPct=math.max(S.lfPowerPct-10,0) end
+  elseif S.hotFill>0 and hp>=CFG.COOLANT.HOT_WARN then log("WARN",string.format("Hot tank: %.1f%%",hp)) end
+  if S.radiation>=CFG.RAD.WARN then log("WARN",string.format("Radiation: %.0f rad/t",S.radiation)) end
+
+  if S.fuelAmt>0 and S.fuelMax>0 then
+    if pct(S.fuelProg,S.fuelMax)>=CFG.FUEL.STOP_PCT and S.mode=="POWER" then
+      log("WARN","Fuel depleted -> shutdown"); S.mode="SHUTDOWN" end
+  elseif S.fuelAmt<=0 and S.mode=="POWER" then
+    log("ERROR","No fuel -> shutdown"); S.mode="SHUTDOWN" end
+end
+
+local function modeInit()
+  sendRodsNow(100)
+  if S.fuelAmt==0 and S.coreHeat==0 then
+    S.initTimer=S.initTimer+CFG.SYS.CYCLE
+    if S.initTimer < 3.0 then return end
+  end
+  S.initTimer=0
+  if S.coreHeat>0 and S.coreHeat>=S.thAZ1 then
+    log("ERROR","Heat too high -> FAULT"); S.mode="FAULT"; return
+  end
+
+  if not CFG.AUTO.CALIBRATED then
+    log("INFO","Config not found -> starting auto-calibration")
+    startCalibration(); return
+  end
+
+  S.heatTarget = pctToHeat(CFG.LF.FIXED_PCT)
+  log("INFO",string.format("OK. Fuel: %d. Heat: %s TU.",S.fuelAmt,fmtN(S.coreHeat)))
+  log("INFO",string.format("Thresholds: AZ1=%s AZ2=%s SCRAM=%s (cap=%s TU)",
+    fmtN(S.thAZ1),fmtN(S.thAZ2),fmtN(S.thScram),fmtN(CFG.HEAT.CAP)))
+  log("INFO","Press [S] to start.")
+  beep(880,0.1); beep(1320,0.1)
+  S.mode="IDLE"
+end
+
+local function modeIdle() sendRods(CFG.RODS.IDLE); pidReset(); S.lfIntegral=0 end
+
+local function modeStartup(dt)
+  S.startTimer=S.startTimer+dt
+  if S.rodTarget<=CFG.RODS.START then
+    log("INFO",string.format("Startup complete. Rods %.1f%% -> POWER",S.rodTarget))
+    beep(660,0.1); beep(880,0.1); beep(1100,0.15)
+    pidReset(); S.mode="POWER"; return
+  end
+  local rate=2.0; if S.coreHeat>S.heatTarget*0.6 then rate=0.5 end
+  sendRods(math.max(S.rodTarget-rate*dt, CFG.RODS.START))
+end
+
+local function modePower(dt)
+  updateLF(dt)
+  S.heatTarget=pctToHeat(S.lfPowerPct)
+  calcThresholds()
+  local delta = pidStep(dt)
+  sendRods(clamp(S.rodTarget - delta, CFG.RODS.PWR_FLOOR, 100))
+end
+
+local function modeShutdown(dt)
+  sendRods(math.min(S.rodTarget+5*dt,100)); pidReset()
+  if S.rodTarget>=99.5 then
+    log("INFO",string.format("Shutdown complete. Heat: %s TU.",fmtN(S.coreHeat)))
+    beep(440,0.2); S.mode="IDLE"
+  end
+end
+
+local function modeScram()
+  sendRodsNow(100)
+  if S.blink and CFG.SYS.AUDIO then pcall(computer.beep,1200,0.04) end
+end
+
+local function modeFault() sendRodsNow(100) end
+
+local K = {
+  BG=0x000D1F,PANEL=0x0A1628,PANEL2=0x061020,BORDER=0x0D3D6B,BORDER2=0x1A5896,
+  TEXT=0x8ABFDE,TEXT2=0x5A8AAB,HEADER=0x00D4FF,HEADER2=0x007799,
+  GREEN=0x00FF80,GREEN2=0x00AA44,YELLOW=0xFFCC00,GOLD=0xFFAA00,
+  ORANGE=0xFF7700,RED=0xFF1A1A,RED2=0xCC0000,DKRED=0x440000,
+  PINK=0xFF55BB,BLUE=0x2299FF,CYAN=0x00AACC,TEAL=0x00CC99,
+  WHITE=0xFFFFFF,GRAY=0x334455,GRAY2=0x1A2A3A,DGRAY=0x0A1520,
+}
+
+local function gs(fg,bg) if not GPU then return end if fg then pcall(GPU.setForeground,fg) end if bg then pcall(GPU.setBackground,bg) end end
+local function gw(x,y,s) if GPU and s then pcall(GPU.set,x,y,tostring(s)) end end
+local function gf(x,y,w,h,c) if GPU then pcall(GPU.fill,x,y,w,h,c or " ") end end
+local function bar(x,y,w,v,m,cf,ce) local n=math.floor(clamp(pct(v,m),0,100)/100*w); gs(cf or K.GREEN,K.PANEL); gw(x,y,string.rep("#",n)); gs(ce or K.GRAY,K.PANEL); gw(x+n,y,string.rep(".",w-n)) end
+local function hcol(h) if h>=S.thScram then return K.RED elseif h>=S.thAZ2 then return K.ORANGE elseif h>=S.thAZ1 then return K.GOLD elseif h>=S.thWarn then return K.YELLOW else return K.GREEN end end
+local MCOL={INIT=0x334455,IDLE=0x00AACC,STARTUP=0x2299FF,POWER=0x00FF80,SHUTDOWN=0xFFCC00,SCRAM=0xFF1A1A,FAULT=0xFF1A1A,CALIBRATE=0xAA44FF}
+local PTITLES={"PWR v7.9 -- MAIN","PHYSICS & LF","CONFIGURATION","EVENT LOG","DIAGNOSTICS"}
+
+local function drawCalibrate()
+  local W,H=S.screenW,S.screenH
+  gs(K.BG,K.BG); gf(1,1,W,H," ")
+  gs(K.HEADER,K.PANEL2); gf(1,1,W,3," ")
+  local ti="=== PWR AUTO-CALIBRATION ==="
+  gw(math.max(1,math.floor((W-#ti)/2)+1),2,ti)
+  gs(K.CYAN,K.PANEL2); gw(2,1,string.format("T+%s [v%s]",fmtT(S.uptime),CFG.SYS.VERSION))
+
+  local step = math.min(S.calStep, CAL_STEPS)
+  local row = 6
+  gs(K.TEXT,K.BG); gw(2,row,"Calibration progress:"); row=row+1
+  bar(2,row,W-4,step,CAL_STEPS,K.BLUE,K.GRAY2)
+  gs(K.CYAN,K.BG); gw(W-10,row,string.format("%d / %d",step,CAL_STEPS)); row=row+2
+
+  gs(K.YELLOW,K.BG); gw(2,row,S.calStatus); row=row+2
+
+  gs(K.BORDER2,K.BG); gw(2,row,"--- Reactor data during calibration ---"); row=row+1
+  gs(K.TEXT2,K.BG); gw(4,row,"Core heat:"); gs(hcol(S.coreHeat),K.BG); gw(24,row,fmtN(S.coreHeat).." TU"); row=row+1
+  gs(K.TEXT2,K.BG); gw(4,row,"heatCap (API):"); gs(K.WHITE,K.BG); gw(24,row,fmtN(S.heatCap).." TU"); row=row+1
+  gs(K.TEXT2,K.BG); gw(4,row,"Rods (log.):"); gs(K.CYAN,K.BG); gw(24,row,string.format("%.1f%%",S.rodLogical)); row=row+1
+  gs(K.TEXT2,K.BG); gw(4,row,"Heat trend:"); gs(S.heatTrend>0 and K.ORANGE or K.GREEN,K.BG); gw(24,row,string.format("%+.0f TU/sec",S.heatTrend)); row=row+2
+
+  gs(K.BORDER2,K.BG); gw(2,row,"--- Results ---"); row=row+1
+  local d=S.calData
+  gs(K.TEXT2,K.BG); gw(4,row,"heatCap measured:"); gs(d.heatCap and K.GREEN or K.GRAY,K.BG); gw(24,row,d.heatCap and fmtN(d.heatCap).." TU" or "waiting..."); row=row+1
+  gs(K.TEXT2,K.BG); gw(4,row,"Storage:"); gs(d.energyMax and K.GREEN or K.GRAY,K.BG); gw(24,row,d.energyMax and (fmtN(d.energyMax).." HE") or "waiting..."); row=row+1
+  gs(K.TEXT2,K.BG); gw(4,row,"Heat rise rate (test):"); gs(d.heatRiseRate and K.GREEN or K.GRAY,K.BG); gw(24,row,d.heatRiseRate and (string.format("%.0f TU/sec",d.heatRiseRate)) or "waiting..."); row=row+2
+
+  gs(K.GRAY,K.DGRAY); gf(1,H,W,1," ")
+  gs(K.TEXT2,K.DGRAY); gw(1,H," Calibration is automatic. Do not touch the rods. [Q] Cancel ")
+end
+
+local function drawHeader()
+  if S.mode=="CALIBRATE" then drawCalibrate(); return end
+  local W,H=S.screenW,S.screenH
+  gs(K.BG,K.BG); gf(1,1,W,H," ")
+  gs(K.HEADER,K.PANEL2); gf(1,1,W,3," ")
+  local ti=PTITLES[S.page] or "PWR"
+  gw(math.max(1,math.floor((W-#ti)/2)+1),2,ti)
+  gs(K.CYAN,K.PANEL2); gw(2,1,string.format("T+%s [v%s]",fmtT(S.uptime),CFG.SYS.VERSION))
+  local calSt = CFG.AUTO.CALIBRATED and "" or " [!NO CALIB]"
+  gs(CFG.AUTO.CALIBRATED and K.GREEN2 or K.ORANGE, K.PANEL2)
+  gw(2,3,"Cycle #"..S.cycleCount..calSt)
+  local ms="[ "..S.mode.." ]"
+  if (S.mode=="SCRAM" or S.mode=="FAULT") and S.blink then gs(K.WHITE,K.DKRED)
+  else gs(MCOL[S.mode] or K.GRAY,K.PANEL2) end
+  gw(W-#ms-1,2,ms)
+  if S.scramCount>0 then gs(K.RED2,K.PANEL2); gw(W-12,3,string.format("SCRAM*%d",S.scramCount)) end
+  gs(K.GRAY,K.DGRAY); gf(1,H,W,1," ")
+  gs(K.TEXT2,K.DGRAY); gw(1,H," [1-5]Pages | [S]Start [X]Stop [R]Reset [C]Recalibrate [Q]Quit ")
+end
+
+local function drawMain()
+  if S.mode=="CALIBRATE" then return end
+  local W,H = S.screenW, S.screenH
+  local L1,L2 = 2, 82
+  local LW = 78
+  local BW = 16
+  local row = 5
+
+  local hc=hcol(S.coreHeat)
+  gs(K.BORDER2,K.BG)
+  gw(L1,row,string.rep("=",LW)); row=row+1
+
+  gs(K.HEADER,K.BG); gw(L1,row," == REACTOR =========================================================="); row=row+1
+
+  gs(K.TEXT2,K.BG); gw(L1,row," Core heat:     ")
+  gs(hc,K.BG); gw(L1+16,row,string.format("%-14s %5.1f%% %s",fmtN(S.coreHeat),pct(S.coreHeat,S.heatCap),tSym(S.heatTrend)))
+  bar(L1+42,row,BW,S.coreHeat,S.heatCap,hc,K.GRAY2); row=row+1
+
+  local hhc=hcol(S.hullHeat)
+  gs(K.TEXT2,K.BG); gw(L1,row," Hull heat:     ")
+  gs(hhc,K.BG); gw(L1+16,row,string.format("%-14s %5.1f%%",fmtN(S.hullHeat),pct(S.hullHeat,S.hullCap)))
+  bar(L1+42,row,BW,S.hullHeat,S.hullCap,hhc,K.GRAY2); row=row+1
+
+  gs(K.TEXT2,K.BG); gw(L1,row," PID setpoint:  ")
+  gs(K.TEAL,K.BG); gw(L1+16,row,string.format("%-14s setpoint: %5.1f%%",fmtN(S.heatTarget),S.lfPowerPct)); row=row+1
+
+  local fc=S.flux>500 and K.PINK or K.BLUE
+  gs(K.TEXT2,K.BG); gw(L1,row," Neutron flux:  ")
+  gs(fc,K.BG); gw(L1+16,row,string.format("%-14.1f",S.flux))
+  bar(L1+42,row,BW,math.min(S.flux,100000),100000,fc,K.GRAY2); row=row+1
+
+  local rPct=100-S.rodLogical
+  local rc=rPct>70 and K.ORANGE or (rPct>30 and K.YELLOW or K.GREEN2)
+  gs(K.TEXT2,K.BG); gw(L1,row," Rods (log):    ")
+  gs(rc,K.BG); gw(L1+16,row,string.format("%5.1f%%  react:%4.1f%%  target:%5.1f%%",S.rodLogical,rPct,S.rodTarget))
+  bar(L1+52,row,BW,rPct,100,rc,K.GRAY2); row=row+1
+
+  gs(K.TEXT2,K.BG); gw(L1,row,string.format(" PID: %+.6f%%/tick   Sigma: %-12.0f heatCap: %s TU",S.pidOut,S.pidIntegral,fmtN(S.heatCap))); row=row+1
+
+  gs(K.BORDER2,K.BG); gw(L1,row,string.rep("-",LW)); row=row+1
+
+  gs(K.HEADER,K.BG); gw(L1,row," == ENERGY BALANCE / LOAD FOLLOWING =================================="); row=row+1
+
+  local bufP=pct(S.energyFill,S.energyMax)
+  local bCol=bufP>60 and K.GREEN or (bufP>25 and K.YELLOW or K.RED)
+  if S.energyFill<0 then bCol=K.GRAY end
+
+  gs(K.TEXT2,K.BG); gw(L1,row," Buffer:        ")
+  if S.energyFill>=0 then
+    gs(bCol,K.BG); gw(L1+16,row,string.format("%6.2f%%  %s / %s HE",bufP,fmtN(S.energyFill),fmtN(S.energyMax)))
+    bar(L1+58,row,BW,bufP,100,bCol,K.GRAY2)
+  else
+    gs(K.GRAY,K.BG); gw(L1+16,row,"no storage (LF in fixed mode)")
+  end
+  row=row+1
+
+  local dStr=S.energyFill>=0 and string.format("%+.0f HE/t",S.energyDelta*20) or "--"
+  local gStr=C.gauge and string.format("%+.0f HE/t",S.powerGauge) or "none"
+  gs(K.TEXT2,K.BG); gw(L1,row," Delta:         "); gs(K.TEAL,K.BG); gw(L1+16,row,string.format("%-16s Gauge: %-14s Setpoint: %5.1f%%",dStr,gStr,S.lfPowerPct)); row=row+1
+
+  local lfStr=CFG.LF.ENABLED and string.format("AUTO (target:%d%% buf)",CFG.LF.BUF_SETPOINT) or string.format("FIXED %d%%",CFG.LF.FIXED_PCT)
+  gs(K.TEXT2,K.BG); gw(L1,row," LF mode:       "); gs(K.CYAN,K.BG); gw(L1+16,row,string.format("%-20s  Ramp: %.1f%%/sec   Sigma: %.2f",lfStr,CFG.LF.RAMP_RATE,S.lfIntegral)); row=row+1
+
+  gs(K.BORDER2,K.BG); gw(L1,row,string.rep("-",LW)); row=row+1
+
+  gs(K.HEADER,K.BG); gw(L1,row," == PROTECTION ==========  == FUEL / COOLANT / RADIATION =========="); row=row+1
+
+  local fp=(S.fuelAmt>0 and S.fuelMax>0) and pct(S.fuelProg,S.fuelMax) or 0
+  local fpc=fp<CFG.FUEL.WARN_PCT and K.GREEN or (fp<CFG.FUEL.STOP_PCT and K.YELLOW or K.RED)
+  local radc=S.radiation>=CFG.RAD.SCRAM and K.RED or (S.radiation>=CFG.RAD.WARN and K.YELLOW or K.GREEN2)
+  local cpct=pct(S.coldFill,S.coldMax); local hpct=pct(S.hotFill,S.hotMax)
+
+  gs(S.az1Active and K.RED or K.GRAY,K.BG)
+  gw(L1,row,string.format("  AZ-1: %s  ",S.az1Active and "[## ACTIVE ##]" or "[             ]"))
+  gs(K.TEXT2,K.BG); gw(L1+26,row," Fuel: ")
+  gs(fpc,K.BG); gw(L1+36,row,string.format("%3d pcs.  Burnup: %5.1f%%",S.fuelAmt,fp)); row=row+1
+
+  gs(S.az2Active and K.ORANGE or K.GRAY,K.BG)
+  gw(L1,row,string.format("  AZ-2: %s  ",S.az2Active and "[## ACTIVE ##]" or "[             ]"))
+  gs(K.TEXT2,K.BG); gw(L1+26,row," Radiation: ")
+  gs(radc,K.BG); gw(L1+37,row,string.format("%8.0f rad/t",S.radiation)); row=row+1
+
+  if S.scramActive and S.blink then gs(K.WHITE,K.DKRED) else gs(S.scramActive and K.RED or K.GRAY,K.BG) end
+  gw(L1,row,string.format("  SCRM: %s  ",S.scramActive and "[!!! ALARM !!]" or "[             ]"))
+  gs(K.TEXT2,K.BG); gw(L1+26,row,string.format(" Cool.cold: %5.1f%%   Cool.hot: %5.1f%%",cpct,hpct)); row=row+1
+
+  local dCol = S.dieselOn and K.YELLOW or K.GRAY
+  if S.dieselOn and S.blink then gs(K.WHITE,K.GOLD) else gs(dCol,K.BG) end
+  gw(L1,row,string.format(" DIESEL: %s",S.dieselOn and "[## ACTIVE ##]" or "[             ]"))
+  gs(K.TEXT2,K.BG); gw(L1+26,row,string.format(" Starts: %d   Threshold: %d%%->%d%%   RS: %d",S.dieselCount,CFG.SYS.DIESEL_BUF,CFG.SYS.DIESEL_STOP,CFG.SYS.RS_DIESEL)); row=row+1
+
+  gs(K.BORDER2,K.BG); gw(L1,row,string.rep("=",LW)); row=row+1
+
+  if S.scramActive and row<=H-1 then
+    local bn=" !!! SCRAM: "..S.scramReason.." !!! "
+    if #bn>W-2 then bn=bn:sub(1,W-5).."... " end
+    if S.blink then gs(K.WHITE,K.DKRED) else gs(K.RED,K.PANEL2) end
+    gf(1,row,W,1," "); gw(math.max(1,math.floor((W-#bn)/2)+1),row,bn)
+  end
+
+  local ry = 5
+  gs(K.BORDER2,K.BG); gw(L2,ry,string.rep("=",LW-2)); ry=ry+1
+  gs(K.HEADER,K.BG); gw(L2,ry," == HEAT THRESHOLDS ================================================"); ry=ry+1
+
+  local function rdr(lbl,val,unit,col)
+    gs(K.TEXT2,K.BG); gw(L2,ry,string.format(" %-22s",lbl))
+    gs(col or K.WHITE,K.BG); gw(L2+23,ry,tostring(val).." "..(unit or ""))
+    ry=ry+1
+  end
+
+  rdr("heatCap (real):",fmtN(S.heatCap),"TU",K.WHITE)
+  rdr("PWR_MIN (0% power):",fmtN(CFG.HEAT.PWR_MIN),"TU",K.CYAN)
+  rdr("PWR_MAX (100% power):",fmtN(CFG.HEAT.PWR_MAX),"TU",K.CYAN)
+  rdr("WARN  (75%):",fmtN(S.thWarn),"TU",K.YELLOW)
+  rdr("AZ-1  (85%):",fmtN(S.thAZ1),"TU",K.GOLD)
+  rdr("AZ-2  (92%):",fmtN(S.thAZ2),"TU",K.ORANGE)
+  rdr("SCRAM (96%):",fmtN(S.thScram),"TU",K.RED)
+  ry=ry+1
+
+  gs(K.BORDER2,K.BG); gw(L2,ry,string.rep("-",LW-2)); ry=ry+1
+  gs(K.HEADER,K.BG); gw(L2,ry," == PID COEFFICIENTS ==============================================="); ry=ry+1
+  rdr("KP:",string.format("%.9f",CFG.PID.KP),"",K.TEXT)
+  rdr("KI:",string.format("%.9f",CFG.PID.KI),"",K.TEXT)
+  rdr("KD:",string.format("%.9f",CFG.PID.KD),"",K.TEXT)
+  rdr("Heat trend:",string.format("%+.0f TU/sec",S.heatTrend),"",S.heatTrend>0 and K.ORANGE or K.GREEN)
+  rdr("PID setpoint:",fmtN(S.heatTarget),"TU",K.TEAL)
+  ry=ry+1
+
+  gs(K.BORDER2,K.BG); gw(L2,ry,string.rep("-",LW-2)); ry=ry+1
+  gs(K.HEADER,K.BG); gw(L2,ry," == LOAD FOLLOWING ================================================="); ry=ry+1
+  rdr("Target buffer:",CFG.LF.BUF_SETPOINT.."%","",K.TEAL)
+  rdr("Current buffer:",string.format("%.2f%%",bufP),"",bCol)
+  rdr("Deviation:",string.format("%+.2f%%",CFG.LF.BUF_SETPOINT-bufP),"",K.TEXT)
+  rdr("LF KP/KI/KD:",string.format("%.2f / %.3f / %.2f",CFG.LF.KP,CFG.LF.KI,CFG.LF.KD),"",K.TEXT2)
+  rdr("Ramp rate:",string.format("%.1f%%/sec",CFG.LF.RAMP_RATE),"",K.TEXT2)
+  rdr("Power setpoint:",string.format("%.1f%%",S.lfPowerPct),"",K.CYAN)
+  ry=ry+1
+
+  gs(K.BORDER2,K.BG); gw(L2,ry,string.rep("-",LW-2)); ry=ry+1
+  gs(K.HEADER,K.BG); gw(L2,ry," == SESSION ========================================================="); ry=ry+1
+  rdr("Uptime:",fmtT(S.uptime),"",K.TEXT)
+  rdr("Cycles:",tostring(S.cycleCount),"",K.TEXT2)
+  rdr("SCRAM count:",tostring(S.scramCount),"times",S.scramCount>0 and K.RED or K.GREEN2)
+  rdr("Storage:",C.energy and "YES" or "NO","",C.energy and K.GREEN or K.GRAY)
+  rdr("Geiger:",C.geiger and "YES" or "NO","",C.geiger and K.GREEN or K.GRAY)
+  gs(K.BORDER2,K.BG); gw(L2,ry,string.rep("=",LW-2))
+end
+
+local function drawPhysics()
+  if S.mode=="CALIBRATE" then return end
+  local row=5
+  local function sect(t) gs(K.BORDER2,K.BG); gw(2,row,"=== "..t); row=row+1 end
+  local function dr(l,v,u,c) gs(K.TEXT2,K.BG); gw(4,row,l); gs(c or K.WHITE,K.BG); gw(42,row,tostring(v).." "..(u or "")); row=row+1 end
+
+  sect("HEAT THRESHOLDS (from auto-calibration)")
+  dr("heatCap (real):",fmtN(S.heatCap),"TU",K.WHITE)
+  dr("PID setpoint:",fmtN(S.heatTarget),"TU",K.TEAL)
+  dr("LF setpoint:",string.format("%.1f%%",S.lfPowerPct),"",K.TEAL)
+  dr("WARN  (%.0f%% of cap):"%CFG.AUTO.WARN_F*100,fmtN(S.thWarn),"TU",K.YELLOW)
+  dr("AZ-1  (%.0f%% of cap):"%CFG.AUTO.AZ1_F*100,fmtN(S.thAZ1),"TU",K.GOLD)
+  dr("AZ-2  (%.0f%% of cap):"%CFG.AUTO.AZ2_F*100,fmtN(S.thAZ2),"TU",K.ORANGE)
+  dr("SCRAM (%.0f%% of cap):"%CFG.AUTO.SCRAM_F*100,fmtN(S.thScram),"TU",K.RED)
+  dr("PWR_MIN (0% power):",fmtN(CFG.HEAT.PWR_MIN),"TU",K.CYAN)
+  dr("PWR_MAX (100% power):",fmtN(CFG.HEAT.PWR_MAX),"TU",K.CYAN)
+  row=row+1
+
+  sect("LOAD FOLLOWING")
+  dr("Buffer:",string.format("%.1f%%",pct(S.energyFill,S.energyMax)),"",K.TEAL)
+  dr("Buffer setpoint:",CFG.LF.BUF_SETPOINT.."%","",K.TEAL)
+  dr("Deviation:",string.format("%+.1f%%",CFG.LF.BUF_SETPOINT-pct(S.energyFill,S.energyMax)),"",K.TEXT)
+  dr("Buffer change rate:",string.format("%+.1f HE/t",S.energyDelta*20),"",K.TEXT)
+  dr("LF integrator:",string.format("%.3f",S.lfIntegral),"",K.TEXT2)
+  dr("Ramp rate:",CFG.LF.RAMP_RATE,"%/sec",K.TEXT2)
+  row=row+1
+
+  sect("PID (auto-tuned)")
+  dr("KP:",string.format("%.9f",CFG.PID.KP),"",K.TEXT)
+  dr("KI:",string.format("%.9f",CFG.PID.KI),"",K.TEXT)
+  dr("KD:",string.format("%.9f",CFG.PID.KD),"",K.TEXT)
+  dr("Heat trend:",string.format("%+.0f TU/sec",S.heatTrend),"",S.heatTrend>0 and K.ORANGE or K.GREEN)
+end
+
+local function drawConfig()
+  if S.mode=="CALIBRATE" then return end
+  local row=5
+  local function sect(n) row=row+1; gs(K.HEADER2,K.BG); gw(2,row,"== "..n.." "..string.rep("=",math.max(0,46-#n))); row=row+1 end
+  local function par(k,v,u) gs(K.TEXT2,K.BG); gw(4,row,k..":"); gs(K.WHITE,K.BG); gw(42,row,tostring(v)..(u and " "..u or "")); row=row+1 end
+
+  sect("CALIBRATION STATUS")
+  par("Calibration done", CFG.AUTO.CALIBRATED and "YES" or "NO (press [C])")
+  par("Config file", CFG.AUTO.CAL_FILE)
+  par("heatCap (calibrated)", fmtN(CFG.HEAT.CAP), "TU")
+  par("PWR_MIN -> PWR_MAX", fmtN(CFG.HEAT.PWR_MIN).." -> "..fmtN(CFG.HEAT.PWR_MAX), "TU")
+
+  sect("LOAD FOLLOWING")
+  par("Mode", CFG.LF.ENABLED and "AUTO" or "FIXED")
+  par("Target buffer level", CFG.LF.BUF_SETPOINT, "%")
+  par("Fixed power (LF off)", CFG.LF.FIXED_PCT, "%")
+  par("Dead zone (deadband)", CFG.LF.DEADBAND, "%")
+  par("Ramp rate", CFG.LF.RAMP_RATE, "%/sec")
+  par("LF controller KP/KI/KD", string.format("%.2f/%.3f/%.2f",CFG.LF.KP,CFG.LF.KI,CFG.LF.KD))
+
+  sect("INTERNAL PID (auto)")
+  par("KP", string.format("%.9f",CFG.PID.KP))
+  par("KI", string.format("%.9f",CFG.PID.KI))
+  par("KD", string.format("%.9f",CFG.PID.KD))
+  par("Max rod step", CFG.PID.ROD_CLAMP, "%/tick")
+
+  sect("SESSION")
+  par("Uptime", fmtT(S.uptime))
+  par("SCRAM", S.scramCount, "times")
+  par("Storage", C.energy and "YES" or "NO")
+  par("Power gauge", C.gauge and "YES" or "NO")
+end
+
+local function drawLog()
+  if S.mode=="CALIBRATE" then return end
+  local maxR=S.screenH-6; local st=math.max(1,#S.log-maxR+1)
+  for i=st,#S.log do
+    local e=S.log[i]; local row=4+i-st
+    if row>S.screenH-1 then break end
+    local c=K.TEXT
+    if e.lvl=="WRN" then c=K.YELLOW elseif e.lvl=="ERR" then c=K.ORANGE elseif e.lvl=="!!!" then c=K.RED end
+    gs(K.GRAY,K.BG); gw(2,row,"["..e.t.."]"); gs(c,K.BG); gw(12,row,"["..e.lvl.."] "..e.msg)
+  end
+end
+
+local function drawDiag()
+  if S.mode=="CALIBRATE" then return end
+  gf(1,4,S.screenW,S.screenH-3," ")
+  local y=4
+  local function dr(l,v,c) gs(K.TEXT2,K.BG); gw(3,y,string.format("%-28s",l)); gs(c or K.WHITE,K.BG); local sv=tostring(v); if #sv>S.screenW-35 then sv=sv:sub(1,S.screenW-38).."..." end; gw(32,y,sv); y=y+1 end
+  local function sep(t) gs(K.BORDER2,K.BG); gw(2,y,"--- "..t.." "..string.rep("-",40-#t)); y=y+1 end
+  gs(K.HEADER,K.PANEL2); gw(2,y,"[ DIAGNOSTICS API v"..CFG.SYS.VERSION.." ]"); y=y+2
+  sep("getHeat()"); dr("Type:",S.dbgHeatType,S.dbgHeatType=="table" and K.GREEN or K.RED); dr("Error:",S.dbgHeatErr,S.dbgHeatErr=="nil" and K.GREEN or K.RED); dr("Keys:",S.dbgHeatKeys,K.CYAN); dr("coreHeat:",S.coreHeat,S.coreHeat>0 and K.GREEN or K.YELLOW); dr("heatCap:",S.heatCap); y=y+1
+  sep("getFuelInfo()"); dr("Type:",S.dbgFuelType,K.CYAN); dr("Keys:",S.dbgFuelKeys,K.CYAN); dr("fuelAmt:",S.fuelAmt,S.fuelAmt>0 and K.GREEN or K.RED); y=y+1
+  sep("Energy"); dr("energyFill:",S.energyFill>=0 and fmtN(S.energyFill) or "none",S.energyFill>=0 and K.GREEN or K.GRAY); dr("energyDelta:",string.format("%+.1f HE/t",S.energyDelta*20)); dr("powerGauge:",C.gauge and string.format("%+.0f HE/t",S.powerGauge) or "none"); y=y+1
+  sep("Auto-config"); dr("Calibration:",CFG.AUTO.CALIBRATED and "YES" or "NO",CFG.AUTO.CALIBRATED and K.GREEN or K.RED); dr("File:",CFG.AUTO.CAL_FILE,K.CYAN); dr("mode:",S.mode,K.CYAN)
+end
+
+local function redraw()
+  if not GPU then return end
+  pcall(function()
+    drawHeader()
+    if S.mode=="CALIBRATE" then return end
+    if     S.page==1 then drawMain()
+    elseif S.page==2 then drawPhysics()
+    elseif S.page==3 then drawConfig()
+    elseif S.page==4 then drawLog()
+    elseif S.page==5 then drawDiag()
+    end
+  end)
+end
+
+local function handleKey(ch)
+  ch=ch:lower()
+  if S.mode=="CALIBRATE" then
+    if ch=="q" then return false end
+    return true
+  end
+  if     ch=="1" then S.page=1; beep(440,0.03)
+  elseif ch=="2" then S.page=2; beep(440,0.03)
+  elseif ch=="3" then S.page=3; beep(440,0.03)
+  elseif ch=="4" then S.page=4; beep(440,0.03)
+  elseif ch=="5" then S.page=5; beep(440,0.03)
+  elseif ch=="c" then
+    log("INFO","Operator: FORCED RECALIBRATION")
+    startCalibration()
+  elseif ch=="s" then
+    if S.mode=="IDLE" then
+      log("INFO","Operator: START"); beep(660,0.1)
+      S.startTimer=0; S.lfPowerPct=20
+      S.heatTarget=pctToHeat(S.lfPowerPct); S.mode="STARTUP"
+    elseif S.mode=="SHUTDOWN" then
+      log("WARN","Interrupt -> POWER"); S.mode="POWER"
+    else log("WARN","Cannot start: "..S.mode) end
+  elseif ch=="x" then
+    if S.mode=="POWER" or S.mode=="STARTUP" then
+      log("INFO","Operator: SHUTDOWN"); beep(440,0.2); S.mode="SHUTDOWN"
+    else log("WARN","Cannot: "..S.mode) end
+  elseif ch=="r" then
+    if S.mode=="SCRAM" then
+      local thr=S.thWarn*0.4
+      if S.coreHeat<thr then
+        log("INFO","SCRAM reset"); S.scramActive=false; S.scramReason=""
+        S.az1Active=false; S.az2Active=false; sirenOff(); pidReset()
+        beep(880,0.1); beep(660,0.1); S.mode="IDLE"
+      else log("WARN",string.format("Reset impossible: heat %s > %s TU",fmtN(S.coreHeat),fmtN(thr))); beep(200,0.15) end
+    elseif S.mode=="FAULT" then
+      log("INFO","FAULT reset -> INIT"); S.initTimer=0; S.mode="INIT"
+    else log("WARN","Reset only from SCRAM/FAULT") end
+  elseif ch=="q" then return false end
+  return true
+end
+
+local function mainLoop()
+  local running=true
+  while running do
+    local now=computer.uptime()
+    local dt=math.max(now-S.lastTime,0.001)
+    S.lastTime=now; S.uptime=S.uptime+dt; S.cycleCount=S.cycleCount+1
+    S.blinkTimer=S.blinkTimer+dt
+    if S.blinkTimer>=0.4 then S.blink=not S.blink; S.blinkTimer=0 end
+
+    local rOk=readAll()
+    if not rOk and S.mode~="INIT" and S.mode~="FAULT" and S.mode~="CALIBRATE" then
+      scram("CONNECTION LOSS") end
+
+    calcThresholds()
+    updateDiesel()
+
+    if S.mode=="CALIBRATE" then
+      local ok,err=pcall(stepCalibrate,dt)
+      if not ok then log("ERROR","Calibration error: "..tostring(err)); S.mode="FAULT" end
+    else
+      if S.mode~="INIT" and S.mode~="FAULT" and S.mode~="SCRAM" then
+        local ok,err=pcall(checkProtections)
+        if not ok then log("ERROR","Protection error: "..tostring(err)); scram("PROTECTION ERROR") end
+      end
+      local ok2,err2=pcall(function()
+        if     S.mode=="INIT"     then modeInit()
+        elseif S.mode=="IDLE"     then modeIdle()
+        elseif S.mode=="STARTUP"  then modeStartup(dt)
+        elseif S.mode=="POWER"    then modePower(dt)
+        elseif S.mode=="SHUTDOWN" then modeShutdown(dt)
+        elseif S.mode=="SCRAM"    then modeScram()
+        elseif S.mode=="FAULT"    then modeFault()
+        end
+      end)
+      if not ok2 then io.write("[MODE ERR] "..tostring(err2).."\n"); pcall(sendRodsNow,100) end
+    end
+
+    redraw()
+    local ev=table.pack(event.pull(CFG.SYS.CYCLE,"key_down"))
+    if ev[1]=="key_down" then
+      local ch=string.char(ev[3] or 0)
+      local ok3,cont=pcall(handleKey,ch)
+      if not ok3 then io.write("[KEY ERR] "..tostring(cont).."\n")
+      elseif cont==false then running=false end
+    end
+  end
+end
+
+local function safeShutdown()
+  if C.pwr then pcall(C.pwr.setLevel,100) end
+  sirenOff()
+  dieselStop()
+  if GPU then
+    pcall(GPU.setBackground,0x000000); pcall(GPU.setForeground,0x00FF80)
+    pcall(GPU.fill,1,1,S.screenW,S.screenH," ")
+    pcall(GPU.set,1,1,"=== PWR v"..CFG.SYS.VERSION.." STOPPED. Rods inserted. ===")
+    pcall(GPU.setForeground,0xFFFFFF)
+  end
+  print("\n[PWR v"..CFG.SYS.VERSION.."] Stopped. setLevel(100) = rods inserted.")
+end
+
+local function main()
+  print("CASCAD v"..CFG.SYS.VERSION.." -- PWR Automatic Control System")
+  print("HBM Nuclear Tech Mod + OpenComputers")
+  initComponents()
+  calcThresholds()
+
+  log("INFO","=== PWR v"..CFG.SYS.VERSION.." START ===")
+  log("INFO","PWR: "..(C.pwr and "OK" or "ERROR"))
+  log("INFO","Storage: "..(C.energy and "OK" or "none"))
+  log("INFO","Power gauge: "..(C.gauge and "OK" or "none"))
+  log("INFO","Geiger: "..(C.geiger and "OK" or "none"))
+
+  if loadCfg() then
+    log("INFO","Config loaded from "..CFG.AUTO.CAL_FILE)
+    calcThresholds()
+  else
+    log("INFO","Config not found -> calibration on first run")
+  end
+
+  S.heatTarget = pctToHeat(CFG.LF.FIXED_PCT)
+  local ok,err = pcall(mainLoop)
+  safeShutdown()
+  if not ok then
+    print("\n[CRITICAL ERROR] "..tostring(err))
+    if C and C.pwr then pcall(C.pwr.setLevel,100) end
+  end
+end
+
+local ok,err=pcall(main)
+if not ok then
+  print("\n[FATAL] "..tostring(err))
+  if component and component.isAvailable("ntm_pwr_control") then
+    local p2ok,p2=pcall(function() return component.proxy(component.list("ntm_pwr_control")()) end)
+    if p2ok and p2 then pcall(p2.setLevel,100) end
+  end
+end
