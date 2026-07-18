@@ -26,7 +26,6 @@ local CLIENT_FILES = {
   {"lib/reactor_ctrl.lua","/lib/reactor_ctrl.lua"},
   {"lib/colors.lua",      "/lib/colors.lua"},
   {"lib/gpu2.lua",        "/lib/gpu2.lua"},
-  {"lib/GUI.lua",         "/lib/GUI.lua"},
   {"control_client.lua",  "/home/control_client.lua"},
   {"setup_screens.lua",   "/home/setup_screens.lua"},
 }
