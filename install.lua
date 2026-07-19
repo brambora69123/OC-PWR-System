@@ -72,7 +72,8 @@ end
 
 local function setupAutorun(compType)
   local script = compType == "reactor" and "reactor_server" or "control_client"
-  local path = "/home/.pwr_autorun"
+  local path = "/boot/autorun.lua"
+  ensureDir(path)
   local f = io.open(path, "w")
   if not f then
     print("WARNING: Could not create " .. path)
@@ -156,7 +157,7 @@ local function main()
   end
   print()
   print("To disable autorun:")
-  print("  rm /home/.pwr_autorun")
+  print("  rm /boot/autorun.lua")
   print("=" .. string.rep("=", 40))
 end
 
