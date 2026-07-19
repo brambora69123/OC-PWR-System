@@ -10,7 +10,7 @@
   Optional: ElnProbe for turbine speed monitoring and motor/alarm control.
 ]]
 
-package.path = package.path .. ";/lib/?.lua;/lib/?/init.lua"
+package.path = package.path .. ";/home/pwr/lib/?.lua;/home/pwr/lib/?/init.lua"
 
 local component = require("component")
 local event     = require("event")

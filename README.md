@@ -1,83 +1,83 @@
-# PWR Reactor Control System v2.1
+# PWR Reactor Control System v2.2
 
-Two-computer OpenComputers setup for controlling HBMs Nuclear Tech Mod PWR reactors in Minecraft 1.7.10. Uses a modular architecture with shared libraries and the GUI framework. Monitors turbine speed via Electrical Age probe for load following.
+Two-computer OpenComputers setup for controlling HBMs Nuclear Tech Mod PWR reactors in Minecraft 1.7.10. Monitors turbine speed via Electrical Age probe for load following. Both screens use direct GPU rendering — no external libraries required.
 
 ## Architecture
 
 ```
 [Reactor Computer]                    [Control Room Computer]
-  ntm_pwr_control  <---direct--->  GPU1+Screen1 (GUI library - reactor status)
-  ElnProbe (turbine/motor/alarm)    GPU2+Screen2 (gpu2 direct - turbine/log)
-  ntm_geiger                         Network Card (modem)
+  ntm_pwr_control                      GPU1+Screen1 (reactor status, controls)
+  ElnProbe (turbine/motor/alarm)       GPU2+Screen2 (turbine, thresholds, log)
+  ntm_geiger                           Network Card (wireless modem)
   Redstone (siren)           
-  Network Card (modem)  <=====>  
-         |
-    Port 7777 (UDP broadcast)
+  Network Card (wireless modem)  
+       |
+  Port 7777 (wireless broadcast)
 ```
 
-## File Structure
+Both computers use standard **Network Cards** (wireless). No cables needed.
+
+## File Structure (on each computer)
+
+Everything is installed to `/home/pwr/`:
 
 ```
-PWRsystem/
+/home/pwr/
   lib/
-    GUI.lua              -- GUI framework (buttons, labels, panels, sliders, etc.)
     protocol.lua         -- Network protocol (message types, serialization)
     reactor_ctrl.lua     -- Reactor control logic (PID, safety, turbine speed LF)
     colors.lua           -- Nuclear theme color palette
-    gpu2.lua             -- Second GPU rendering helper (direct GPU calls)
+    gpu2.lua             -- GPU rendering helper (direct GPU calls)
   reactor_server.lua     -- Server: controls reactor, hosts modem server
-  control_client.lua     -- Client: 2-screen GUI, sends commands
+  control_client.lua     -- Client: 2-screen display, keyboard controls
   setup_screens.lua      -- One-time GPU/screen binding utility
-  README.md              -- This file
+  install.lua            -- Installer (run this first)
 ```
-
-## Modules
-
-| Module | Purpose |
-|--------|---------|
-| `lib/protocol.lua` | Shared network protocol: message types (`HELLO`, `START`, `SCRAM`, `TELEMETRY`, etc.), serialization helpers, port config |
-| `lib/reactor_ctrl.lua` | Encapsulates all reactor state and control: PID controller, turbine speed load following, safety interlocks, auto-calibration, sensor reading, mode state machine, ELN probe integration |
-| `lib/colors.lua` | Color constants for the nuclear control room theme (shared between server diagnostics and client UI) |
-| `lib/gpu2.lua` | Renders to the second GPU via direct `component.invoke()` calls, independent of the primary GPU/doubleBuffering used by GUI.lua |
-| `lib/GUI.lua` | Full GUI framework: application, container, button, label, panel, progressBar, slider, switch, input, textBox, chart, layout, etc. Uses doubleBuffering for smooth rendering |
 
 ## Hardware Requirements
 
-### Reactor Computer (1st PC)
+### Reactor Computer
 - 1x CPU Tier 3
 - 1x RAM Tier 3 (4GB)
 - 1x Hard Drive Tier 3
-- 1x Network Card (modem) -- **REQUIRED**
+- 1x Network Card (wireless) — **REQUIRED**
 - 1x GPU Tier 1 + Screen Tier 1 (for local diagnostics, optional)
 - 1x Redstone Card (for siren control, optional)
-- 1x ElnProbe (for turbine speed, motor relay, alarm -- **RECOMMENDED**)
+- 1x ElnProbe (for turbine speed, motor relay, alarm — **RECOMMENDED**)
 - Placed adjacent to PWR reactor controller block
 
-### Control Room Computer (2nd PC)
+### Control Room Computer
 - 1x CPU Tier 3
 - 1x RAM Tier 3 (4GB)
 - 1x Hard Drive Tier 3
-- 1x Network Card (modem) -- **REQUIRED**
-- **2x GPU Tier 3** -- for dual-screen setup
-- **2x Screen Tier 3** -- for maximum resolution (160x50 each)
+- 1x Network Card (wireless) — **REQUIRED**
+- **2x GPU Tier 3** — for dual-screen setup
+- **2x Screen Tier 3** — for maximum resolution (160x50 each)
 - Keyboard
 
 ## Setup Instructions
 
 ### Step 1: Install Files
 
-Copy the entire `lib/` folder and both `.lua` scripts to each computer:
-- Reactor PC: needs `lib/protocol.lua`, `lib/reactor_ctrl.lua`, `reactor_server.lua`
-- Control Room PC: needs all `lib/` files and `control_client.lua`, `setup_screens.lua`
+On each computer, run:
+
+```
+wget https://raw.githubusercontent.com/brambora69123/OC-PWR-System/main/install.lua install.lua
+install.lua
+```
+
+The installer will:
+1. Detect whether this is a reactor or control room PC
+2. Download all required files to `/home/pwr/`
+3. Optionally set up autorun on boot
 
 ### Step 2: Reactor Computer
 
 1. Place the computer next to the PWR reactor controller
 2. Place the ElnProbe adjacent to the computer (connect to your shaft network)
-3. Configure ELN probe sides in `lib/reactor_ctrl.lua` (defaultConfig ELN section)
-4. Insert a network card
-5. Run `reactor_server`
-6. The server will:
+3. Configure ELN probe sides in `/home/pwr/lib/reactor_ctrl.lua` (defaultConfig ELN section)
+4. Run `reactor_server`
+5. The server will:
    - Initialize all reactor components
    - Auto-calibrate on first run (measures heat capacity, tunes PID)
    - Listen for control room connections on port 7777
@@ -85,7 +85,7 @@ Copy the entire `lib/` folder and both `.lua` scripts to each computer:
 
 ### Step 3: ELN Probe Configuration
 
-The ElnProbe has 6 sides (XN, XP, YN, YP, ZN, ZP). Configure which side connects to which signal in `lib/reactor_ctrl.lua`:
+The ElnProbe has 6 sides (XN, XP, YN, YP, ZN, ZP). Configure which side connects to which signal in `/home/pwr/lib/reactor_ctrl.lua`:
 
 ```lua
 ELN = {
@@ -105,38 +105,31 @@ Wire the probe sides to your ELN signals:
 ### Step 4: Control Room Computer
 
 1. Install 2x GPU Tier 3 and 2x Screen Tier 3
-2. Insert a network card
-3. Run `setup_screens` once to bind GPUs to screens
-4. Run `control_client`
+2. Run `setup_screens` once to bind GPUs to screens
+3. Run `control_client`
 
-## Control Room GUI
+## Display Layout
 
-### Screen 1 (Left) - GUI Library
-Built with `lib/GUI.lua`, uses `doubleBuffering` for smooth rendering:
-- Reactor status: core/hull heat bars, flux, rods, PID info
-- Turbine speed (rad/s) with optimal range indicator
-- Motor status (running/off) and fault indicator
-- Alarm status (active/off)
+### Screen 1 (Left) — Reactor Status
+- Core/hull heat bars with color-coded thresholds
+- Flux, rod position, PID output
+- Turbine speed, motor status, alarm status
 - Fuel, radiation, coolant levels
-- Protection indicators: AZ-1, AZ-2, SCRAM (color-coded)
-- Control buttons: START, STOP, SCRAM, RECAL
-- Power setpoint slider (0-100%)
+- Protection indicators: AZ-1, AZ-2, SCRAM
+- Keyboard control reference
 - SCRAM banner (flashing)
 
-### Screen 2 (Right) - GPU2 Direct
-Rendered via `lib/gpu2.lua` using direct GPU calls:
-- Turbine speed with progress bar (0-250 rad/s)
-- Optimal range display (195-205 rad/s)
-- Motor and alarm status
-- Heat target and LF mode
-- Heat thresholds (WARN, AZ-1, AZ-2, SCRAM)
-- Event log (scrolling, color-coded: INF/WRN/ERR/CRIT)
+### Screen 2 (Right) — Turbine / Log
+- Turbine speed bar (0-250 rad/s) with optimal range
+- Heat target, LF mode
+- Configurable thresholds (WARN, AZ-1, AZ-2, SCRAM)
+- Scrolling event log (INF/WRN/ERR/CRIT, color-coded)
 
 ## Keyboard Controls
 
 | Key | Action |
 |-----|--------|
-| `S` | Start reactor (IDLE -> STARTUP -> POWER) |
+| `S` | Start reactor (IDLE → STARTUP → POWER) |
 | `X` | Stop reactor (shutdown gracefully) |
 | `R` | SCRAM (emergency) or RESET (clear SCRAM/FAULT) |
 | `C` | Force recalibration |
@@ -164,10 +157,10 @@ Rendered via `lib/gpu2.lua` using direct GPU calls:
 
 Steam is always processed regardless of load. More heat = more steam = more mechanical power capacity. The system adjusts heat target based on turbine speed:
 
-- **Turbine speed low** (high load on shaft): Increase heat target -> more steam -> more capacity
-- **Turbine speed high** (low load on shaft): Decrease heat target -> less steam -> save fuel
+- **Turbine speed low** (high load on shaft): Increase heat target → more steam → more capacity
+- **Turbine speed high** (low load on shaft): Decrease heat target → less steam → save fuel
 - **Target speed**: 200 rad/s (configurable, optimal range 195-205)
-- **Manual mode**: Slider sets heat target percentage directly
+- **Manual mode**: Heat target percentage set directly
 
 ## Auto-Calibration
 
@@ -175,11 +168,11 @@ On first run, the reactor server auto-calibrates:
 1. Reads reactor heat capacity from NTM API
 2. Performs inertia test (brief rod extraction, measures heat rise rate)
 3. Calculates PID coefficients tuned to reactor dynamics
-4. Saves calibration to `/home/pwr_cfg.lua`
+4. Saves calibration to `/home/pwr/pwr_cfg.lua`
 
 ## Customization
 
-Edit `lib/reactor_ctrl.lua` (defaultConfig) or create `/home/pwr_cfg.lua`:
+Edit `/home/pwr/lib/reactor_ctrl.lua` (defaultConfig) or `/home/pwr/pwr_cfg.lua`:
 - Heat thresholds (or use auto-calibration)
 - PID coefficients (auto-tuned on calibration)
 - Load following: target speed, deadband, ramp rate, PID gains
@@ -199,7 +192,7 @@ Edit `lib/reactor_ctrl.lua` (defaultConfig) or create `/home/pwr_cfg.lua`:
 - Check that the Electrical Age mod is installed
 
 **Client can't connect:**
-- Both computers need network cards
+- Both computers need Network Cards (not Wired Network Cards)
 - Both must be on the same Minecraft server/world
 - Port 7777 must not be used by another mod
 - Restart both scripts
@@ -209,6 +202,7 @@ Edit `lib/reactor_ctrl.lua` (defaultConfig) or create `/home/pwr_cfg.lua`:
 - Both screens must be Tier 3 (160x50 max)
 - Both GPUs must be Tier 3
 
-**GUI library errors:**
-- Ensure `lib/GUI.lua` and its dependencies (`doubleBuffering`, `color`, `image`, `unicode`) are installed
-- These are part of OpenOS/MineOS standard libraries
+**Autorun not working:**
+- Check `/home/.pwr_autorun` exists
+- Ensure the file has correct path to your script
+- Remove and reinstall: `rm /home/.pwr_autorun`
